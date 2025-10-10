@@ -3,6 +3,9 @@ const qoi = @import("qoi.zig");
 const stb = @import("stb.zig");
 
 pub fn main() !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    var gpa = debug_allocator.allocator();
+
     var buf: [4096]u8 = undefined;
 
     const qoi_bytes = try std.fs.cwd().readFile("qoi_test_images/edgecase.qoi", &buf);
@@ -13,8 +16,8 @@ pub fn main() !void {
         header.width * header.height,
         header.channels,
     });
-    const image = try qoi.decode(std.heap.page_allocator, qoi_bytes);
-    defer std.heap.page_allocator.free(image.pixels);
+    const image = try qoi.decode(gpa, qoi_bytes);
+    defer gpa.free(image.pixels);
 
     // var stdout_buf: [4096]u8 = undefined;
     // var stdout_f = std.fs.File.stdout();
