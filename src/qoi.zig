@@ -2,14 +2,23 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const max_pixels = 400_000_000;
-pub const byte_stream_suffix = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+pub const encoding_epilogue = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+pub const signature = [4]u8{ 'q', 'o', 'i', 'f' };
+pub const magic_number = 0x716f6966;
 
-pub const Qoi = struct {
+pub const DecodeError = error{ InvalidQoi, ImageTooLarge, OutOfMemory, InvalidEncoding };
+pub const EncodeError = error{ EmptyPixelBuffer, ZeroPixelCount, ImageTooLarge, OutOfMemory };
+
+pub const Image = struct {
     pixels: []u8,
     width: u32,
     height: u32,
     channels: Channel,
-    colorspace: Colorspace,
+    colorspace: Colorspace = .srgb,
+
+    pub fn deinit(self: Image, gpa: Allocator) void {
+        gpa.free(self.pixels);
+    }
 };
 
 pub const Channel = enum(u8) {
@@ -22,56 +31,43 @@ pub const Colorspace = enum(u8) {
     linear = 1,
 };
 
-const HeaderFull = packed struct {
-    magic: u32,
+pub const Desc = struct {
+    const size = 14;
     width: u32,
     height: u32,
-    channels: u8,
-    colorspace: u8,
-};
+    channels: Channel,
+    colorspace: Colorspace,
 
-pub const Header = packed struct {
-    width: u32,
-    height: u32,
-    channels: u8,
-    colorspace: u8,
-
-    pub const signature = [4]u8{ 'q', 'o', 'i', 'f' };
-    pub const magic = std.mem.readInt(u32, &signature, .big);
-
-    pub fn decode(data: []const u8) !Header {
-        if (data.len < @sizeOf(HeaderFull)) return error.TooSmall;
-        if (std.mem.readInt(u32, data[0..4], .big) != Header.magic) return error.InvalidSignature;
+    pub fn decode(data: []const u8) DecodeError!Desc {
+        if (data.len < size) return error.InvalidQoi;
+        if (std.mem.readInt(u32, data[0..4], .big) != magic_number) return error.InvalidQoi;
 
         const width = std.mem.readInt(u32, data[4..8], .big);
         const height = std.mem.readInt(u32, data[8..12], .big);
         const channels = data[12];
         const colorspace = data[13];
 
-        if (width == 0 or height == 0) return error.InvalidDimensions;
-        if (channels < 3 or channels > 4) return error.InvalidChannels;
-        if (colorspace > 1) return error.InvalidColorspace;
+        if (width == 0 or height == 0) return error.InvalidQoi;
 
         return .{
             .width = width,
             .height = height,
-            .channels = channels,
-            .colorspace = colorspace,
+            .channels = std.enums.fromInt(Channel, channels) orelse return error.InvalidQoi,
+            .colorspace = std.enums.fromInt(Colorspace, colorspace) orelse return error.InvalidQoi,
         };
     }
 };
 
-pub const EncodeTag = union(enum) {
-    run,
-    prev,
-    diff,
-    index,
-    luma,
-    rgb,
-    rgba,
+const Encoding = struct {
+    pub const index: u8 = 0x00;
+    pub const diff: u8 = 0x40;
+    pub const luma: u8 = 0x80;
+    pub const run: u8 = 0xc0;
+    pub const rgb: u8 = 0xfe;
+    pub const rgba: u8 = 0xff;
 };
 
-pub const Pixel = packed struct(u32) {
+const Pixel = packed struct(u32) {
     r: u8 = 0,
     g: u8 = 0,
     b: u8 = 0,
@@ -82,87 +78,237 @@ pub const Pixel = packed struct(u32) {
     }
 };
 
-pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
-    const header = try Header.decode(bytes);
-    const num_pixels = header.width * header.height;
-    if (num_pixels > max_pixels) return error.ImageTooLarge;
-    const byte_len = num_pixels * header.channels;
+pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
+    const pixel_count = desc.height * desc.width;
+
+    if (pixels.len == 0) return error.EmptyPixelBuffer;
+    if (pixel_count == 0) return error.ZeroPixelCount;
+    if (pixel_count >= max_pixels) return error.ImageTooLarge;
+
+    const channels = @intFromEnum(desc.channels);
+    // based on the worstcase of every pixel being encoded individually
+    // along with an rbg(a) tag byte
+    const max_size = pixel_count * (channels + 1) + Desc.size + encoding_epilogue.len;
+
+    var bytes_list: std.ArrayList(u8) = try .initCapacity(gpa, max_size);
+    var bytes = bytes_list.allocatedSlice();
+
+    std.mem.writeInt(u32, bytes[0..4], magic_number, .big);
+    std.mem.writeInt(u32, bytes[4..8], desc.width, .big);
+    std.mem.writeInt(u32, bytes[8..12], desc.height, .big);
+    bytes[12] = channels;
+    bytes[13] = @intFromEnum(desc.colorspace);
+
+    var write_offset: u32 = Desc.size;
+
+    const pixel_len = pixel_count * channels;
+    const pixel_end = pixel_len - channels;
+
+    var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
+    var prev_pixel = Pixel{};
+    var curr_pixel = Pixel{};
+    var run_len: u8 = 0;
+
+    var pixel_offset: u32 = 0;
+    while (pixel_offset < pixel_len) : (pixel_offset += channels) {
+        curr_pixel.r = pixels[pixel_offset];
+        curr_pixel.g = pixels[pixel_offset + 1];
+        curr_pixel.b = pixels[pixel_offset + 2];
+        if (desc.channels == .rgba)
+            curr_pixel.a = pixels[pixel_offset + 3];
+
+        // continue an active run
+        if (curr_pixel == prev_pixel) {
+            run_len += 1;
+            if (run_len == 62 or pixel_offset == pixel_end) {
+                bytes[write_offset] = Encoding.run | (run_len - 1);
+                write_offset += 1;
+                run_len = 0;
+            }
+        } else {
+            var index_pos: u8 = 0;
+
+            // finish an active run
+            if (run_len > 0) {
+                bytes[write_offset] = Encoding.run | (run_len - 1);
+                write_offset += 1;
+                run_len = 0;
+            }
+
+            index_pos = curr_pixel.hash();
+
+            // save an index
+            if (index[index_pos] == curr_pixel) {
+                bytes[write_offset] = Encoding.index | index_pos;
+                write_offset += 1;
+            } else {
+                index[index_pos] = curr_pixel;
+
+                if (curr_pixel.a == prev_pixel.a) {
+                    const r_diff = curr_pixel.r -% prev_pixel.r;
+                    const g_diff = curr_pixel.g -% prev_pixel.g;
+                    const b_diff = curr_pixel.b -% prev_pixel.b;
+
+                    const rg_diff = r_diff -% g_diff;
+                    const bg_diff = b_diff -% g_diff;
+
+                    // small diff
+                    // -3 < diff < 2
+                    if (r_diff > 253 and r_diff < 2 and
+                        g_diff > 253 and g_diff < 2 and
+                        b_diff > 253 and b_diff < 2)
+                    {
+                        const r_diff2 = (r_diff +% 2) << 4;
+                        const g_diff2 = (g_diff +% 2) << 2;
+                        const b_diff2 = b_diff +% 2;
+                        bytes[write_offset] = Encoding.diff | r_diff2 | g_diff2 | b_diff2;
+                        write_offset += 1;
+
+                        // luminance diff
+                        // -9 < rb_diff < 8
+                        // -33 < g_diff < 32
+                    } else if (rg_diff > 247 and rg_diff < 8 and
+                        g_diff > 223 and g_diff < 32 and
+                        bg_diff > 247 and bg_diff < 8)
+                    {
+                        const g_diff2 = g_diff +% 32;
+                        const rg_diff2 = (rg_diff +% 8) << 4;
+                        const bg_diff2 = (bg_diff +% 8);
+                        bytes[write_offset] = Encoding.luma | g_diff2;
+                        bytes[write_offset + 1] = rg_diff2 | bg_diff2;
+                        write_offset += 2;
+
+                        // store single rgb pixel
+                    } else {
+                        bytes[write_offset] = Encoding.rgb;
+                        bytes[write_offset + 1] = curr_pixel.r;
+                        bytes[write_offset + 2] = curr_pixel.g;
+                        bytes[write_offset + 3] = curr_pixel.b;
+                        write_offset += 4;
+                    }
+
+                    // store single rgba pixel
+                } else {
+                    bytes[write_offset] = Encoding.rgba;
+                    bytes[write_offset + 1] = curr_pixel.r;
+                    bytes[write_offset + 2] = curr_pixel.g;
+                    bytes[write_offset + 3] = curr_pixel.b;
+                    bytes[write_offset + 4] = curr_pixel.a;
+                    write_offset += 5;
+                }
+            }
+        }
+
+        prev_pixel = curr_pixel;
+    }
+
+    @memcpy(bytes[write_offset .. write_offset + 8], &encoding_epilogue);
+    write_offset += 8;
+
+    bytes_list.items = bytes[0..write_offset];
+    // bytes_list.shrinkAndFree(gpa, write_offset);
+
+    return try bytes_list.toOwnedSlice(gpa);
+}
+
+fn debug(tag: u8, off: u32, px: Pixel) void {
+    const name = switch (tag) {
+        Encoding.index => "INDEX",
+        Encoding.diff => "DIFF",
+        Encoding.luma => "LUMA",
+        Encoding.run => "RUN",
+        Encoding.rgb => "RGB",
+        Encoding.rgba => "RGBA",
+        else => unreachable,
+    };
+
+    std.debug.print("{x} {s} px: 0x{x}\n", .{ off, name, @as(u32, @bitCast(px)) });
+}
+
+pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Image {
+    const desc = try Desc.decode(bytes);
+
+    const pixel_count = desc.width * desc.height;
+    if (pixel_count > max_pixels) return error.ImageTooLarge;
+
+    const channels = @intFromEnum(desc.channels);
+    const byte_len = pixel_count * channels;
     var pixels = try gpa.alloc(u8, byte_len);
     errdefer gpa.free(pixels);
 
     var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
-    var prev = Pixel{};
-    const chunks_len = bytes.len - byte_stream_suffix.len;
-    var idx: u32 = 14;
-    var runs: u8 = 0;
-    var px_idx: u32 = 0;
-    while (px_idx < byte_len) : (px_idx += header.channels) {
-        if (runs > 0) {
-            runs -= 1;
-        } else if (idx < chunks_len) {
-            const tag_byte = bytes[idx];
-            idx += 1;
-            switch (tag_byte) {
-                // QOI_OP_RGB
-                0b1111_1110 => {
-                    prev.r = bytes[idx];
-                    prev.g = bytes[idx + 1];
-                    prev.b = bytes[idx + 2];
-                    idx += 3;
+    var prev_pixel = Pixel{};
+    const chunks_len = bytes.len - encoding_epilogue.len;
+    var read_offset: u32 = 14;
+    var run_len: u8 = 0;
+
+    var pixel_offset: u32 = 0;
+    while (pixel_offset < byte_len) : (pixel_offset += channels) {
+        if (run_len > 0) {
+            run_len -= 1;
+        } else if (read_offset < chunks_len) {
+            const tag = bytes[read_offset];
+            read_offset += 1;
+            switch (tag) {
+                Encoding.rgb => {
+                    prev_pixel.r = bytes[read_offset];
+                    prev_pixel.g = bytes[read_offset + 1];
+                    prev_pixel.b = bytes[read_offset + 2];
+                    read_offset += 3;
                 },
-                // QOI_OP_RGBA
-                0b1111_1111 => {
-                    prev.r = bytes[idx];
-                    prev.g = bytes[idx + 1];
-                    prev.b = bytes[idx + 2];
-                    prev.a = bytes[idx + 3];
-                    idx += 4;
+                Encoding.rgba => {
+                    prev_pixel.r = bytes[read_offset];
+                    prev_pixel.g = bytes[read_offset + 1];
+                    prev_pixel.b = bytes[read_offset + 2];
+                    prev_pixel.a = bytes[read_offset + 3];
+                    read_offset += 4;
                 },
-                else => switch ((tag_byte & 0xc0) >> 6) {
-                    // QOI_OP_INDEX
-                    0b00 => {
-                        prev = index[tag_byte];
+                else => switch (tag & 0xc0) {
+                    Encoding.index => {
+                        prev_pixel = index[tag];
                     },
-                    // QOI_OP_DIFF
-                    0b01 => {
-                        prev.r +%= ((tag_byte >> 4) & 0x03) -% 2;
-                        prev.g +%= ((tag_byte >> 2) & 0x03) -% 2;
-                        prev.b +%= (tag_byte & 0x03) -% 2;
+                    Encoding.diff => {
+                        prev_pixel.r +%= ((tag >> 4) & 0x03) -% 2;
+                        prev_pixel.g +%= ((tag >> 2) & 0x03) -% 2;
+                        prev_pixel.b +%= (tag & 0x03) -% 2;
                     },
-                    // QOI_OP_LUMA
-                    0b10 => {
-                        const b = bytes[idx];
-                        idx += 1;
-                        const green_diff = (tag_byte & 0x3f) -% 32;
-                        prev.r +%= green_diff -% 8 +% ((b >> 4) & 0x0f);
-                        prev.g +%= green_diff;
-                        prev.b +%= green_diff -% 8 +% (b & 0x0f);
+                    Encoding.luma => {
+                        const b = bytes[read_offset];
+                        read_offset += 1;
+                        const green_diff = (tag & 0x3f) -% 32;
+                        prev_pixel.r +%= green_diff -% 8 +% ((b >> 4) & 0x0f);
+                        prev_pixel.g +%= green_diff;
+                        prev_pixel.b +%= green_diff -% 8 +% (b & 0x0f);
                     },
-                    // QOI_OP_RUN
-                    0b11 => {
-                        runs = tag_byte & 0x3f;
+                    Encoding.run => {
+                        run_len = tag & 0x3f;
                     },
-                    else => unreachable,
+                    else => return error.InvalidEncoding,
                 },
             }
 
-            index[prev.hash()] = prev;
+            index[prev_pixel.hash()] = prev_pixel;
         }
 
-        pixels[px_idx] = prev.r;
-        pixels[px_idx + 1] = prev.g;
-        pixels[px_idx + 2] = prev.b;
-        if (header.channels == @intFromEnum(Channel.rgba))
-            pixels[px_idx + 3] = prev.a;
+        pixels[pixel_offset] = prev_pixel.r;
+        pixels[pixel_offset + 1] = prev_pixel.g;
+        pixels[pixel_offset + 2] = prev_pixel.b;
+        if (desc.channels == .rgba)
+            pixels[pixel_offset + 3] = prev_pixel.a;
     }
-
-    std.debug.assert(std.mem.eql(u8, bytes[idx..], &byte_stream_suffix));
 
     return .{
         .pixels = pixels,
-        .width = header.width,
-        .height = header.height,
-        .channels = @enumFromInt(header.channels),
-        .colorspace = @enumFromInt(header.colorspace),
+        .width = desc.width,
+        .height = desc.height,
+        .channels = desc.channels,
+        .colorspace = desc.colorspace,
     };
+}
+
+test "Pixel hashing" {
+    var black = Pixel{};
+    var magenta = Pixel{ .r = 255, .b = 255 };
+    try std.testing.expectEqual(53, black.hash());
+    try std.testing.expectEqual(43, magenta.hash());
 }

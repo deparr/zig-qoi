@@ -13,34 +13,27 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var namebuf: [128]u8 = undefined;
+    var x: c_int = 0;
+    var y: c_int = 0;
+    var n: c_int = 0;
+    const image = @as([*]u8, stb.load("qoi_test_images/edgecase.png", &x, &y, &n, 4));
+    std.debug.print("{d}x{d}@{d}\n", .{x, y, n });
 
-    for ([_][]const u8{
-        "dice",
-        "edgecase",
-        "kodim10",
-        "kodim23",
-        "qoi_logo",
-        "testcard",
-        "testcard_rgba",
-        "wikipedia_008",
-    }) |impath| {
-        const pathname = try std.fmt.bufPrint(&namebuf, "qoi_test_images/{s}.qoi", .{impath});
-        const qoi_bytes = try std.fs.cwd().readFileAlloc(gpa, pathname, 2 * 1024 * 1024);
-        defer gpa.free(qoi_bytes);
-        const image = try qoi.decode(gpa, qoi_bytes);
-        defer gpa.free(image.pixels);
+    const encoded_qoi_bytes = try qoi.encode(gpa, image[0..@intCast(x * y * 4)], .{
+        .width = @intCast(x),
+        .height = @intCast(y),
+        .channels = .rgba,
+        .colorspace = .srgb,
+    });
+    defer gpa.free(encoded_qoi_bytes);
 
-        const outpathname = try std.fmt.bufPrintZ(&namebuf, "decoded_{s}.png", .{impath});
-        if (stb.write_png(
-            @ptrCast(outpathname.ptr),
-            @intCast(image.width),
-            @intCast(image.height),
-            @intCast(@intFromEnum(image.channels)),
-            @ptrCast(image.pixels.ptr),
-            0,
-        ) == 0) std.debug.print("{s}: failed to write decoded png", .{impath});
-    }
+    var iobuf: [2048]u8 = undefined;
+
+    var stdout_f = std.fs.File.stdout();
+    var stdout_w = stdout_f.writer(&iobuf);
+    var stdout = &stdout_w.interface;
+    try stdout.writeAll(encoded_qoi_bytes);
+    try stdout.flush();
 }
 
 fn writeBitmap(w: *std.Io.Writer, img: qoi.Qoi) !void {
