@@ -2,3 +2,4 @@
 zig-out/
 *dump
 ./*png
+res/qoi/

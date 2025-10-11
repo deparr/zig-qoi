@@ -5,31 +5,56 @@ const stb = @import("stb.zig");
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     var gpa = debug_allocator.allocator();
+    defer _ = debug_allocator.deinit();
 
-    var buf: [4096]u8 = undefined;
-
-    const qoi_bytes = try std.fs.cwd().readFile("qoi_test_images/edgecase.qoi", &buf);
-    const header = try qoi.Header.decode(qoi_bytes);
-    std.debug.print("{d}x{d} ({d}) @ {d}\n", .{
-        header.width,
-        header.height,
-        header.width * header.height,
-        header.channels,
-    });
+    const qoi_bytes = try std.fs.cwd().readFileAlloc(gpa, "qoi_test_images/dice.qoi", 1 << 20);
+    defer gpa.free(qoi_bytes);
     const image = try qoi.decode(gpa, qoi_bytes);
     defer gpa.free(image.pixels);
 
     // var stdout_buf: [4096]u8 = undefined;
     // var stdout_f = std.fs.File.stdout();
     // var stdout = stdout_f.writer(&stdout_buf);
-    // try stdout.interface.writeAll(image.pixels);
+    // try writeBitmap(&stdout.interface, image);
 
-    // const imf = stb.load("qoi_test_images/edgecase.png", &x, &y, &n, 4);
-    // defer stb.image_free(imf);
-    // if (stb.write_png("png_to_png.png", x, y, n, imf, x * n) == 0) {
-    //     std.debug.print("pngpng res was 0\n", .{});
-    // }
-    if (stb.write_png("qoi_to_png.png", @intCast(image.width), @intCast(image.height), 4, @ptrCast(image.pixels.ptr), @intCast(image.width * 4)) == 0) {
-        std.debug.print("qoipng res was 0\n", .{});
+    if (stb.write_png("qoi_to_png.png", @intCast(image.width), @intCast(image.height), 4, @ptrCast(image.pixels.ptr), @intCast(image.width * 4)) == 0)
+        std.debug.print("png write res was 0\n", .{});
+}
+
+fn writeBitmap(w: *std.Io.Writer, img: qoi.Qoi) !void {
+    const padding = img.width % 4;
+    const file_size = 54 + img.width * img.height * 3 + padding * (img.height - 1);
+    try w.writeAll("BM");
+    try w.writeInt(u32, file_size, .little);
+    try w.writeInt(u32, 0, .little); // reserved
+    try w.writeInt(u32, 54, .little); // offset to pixels
+    try w.writeInt(u32, 40, .little); // dib header size
+    try w.writeInt(u32, img.width, .little);
+    try w.writeInt(u32, img.height, .little);
+    try w.writeInt(u16, 1, .little); // color planes
+    try w.writeInt(u16, 24, .little); // bits per pixel
+    try w.writeInt(u32, 0, .little); // compression
+    try w.writeInt(u32, file_size - 54, .little); // raw bitmap size
+    try w.writeInt(u32, 2835, .little); // print resolution
+    try w.writeInt(u32, 2835, .little); // print resolution
+    try w.writeInt(u32, 0, .little); // palette colors
+    try w.writeInt(u32, 0, .little); // important colors
+
+    for (0..img.height) |row| {
+        const flipped = img.height - row - 1;
+
+        const row_start_pos = flipped * img.width * 4 + flipped * padding;
+        for (0..img.width) |col| {
+            const px_pos = row_start_pos + col * 4;
+            const r: u24 = img.pixels[px_pos];
+            const g: u24 = img.pixels[px_pos + 1];
+            const b: u24 = img.pixels[px_pos + 2];
+            const pixel: u24 = r << 16 | g << 8 | b;
+            try w.writeInt(u24, pixel, .little);
+        }
+
+        _ = try w.splatByte(0, padding);
     }
+
+    try w.flush();
 }

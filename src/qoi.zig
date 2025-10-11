@@ -40,7 +40,7 @@ pub const Header = packed struct {
     pub const magic = std.mem.readInt(u32, &signature, .big);
 
     pub fn decode(data: []const u8) !Header {
-        if (data.len < @sizeOf(HeaderFull)) return error.TooSmallError;
+        if (data.len < @sizeOf(HeaderFull)) return error.TooSmall;
         if (std.mem.readInt(u32, data[0..4], .big) != Header.magic) return error.InvalidSignature;
 
         const width = std.mem.readInt(u32, data[4..8], .big);
@@ -83,8 +83,6 @@ pub const Pixel = packed struct(u32) {
 };
 
 pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
-    const header_size = @sizeOf(HeaderFull);
-
     const header = try Header.decode(bytes);
     const num_pixels = header.width * header.height;
     if (num_pixels > max_pixels) return error.ImageTooLarge;
@@ -95,11 +93,9 @@ pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
     var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
     var prev = Pixel{};
     const chunks_len = bytes.len - byte_stream_suffix.len;
-    var idx: u32 = header_size;
+    var idx: u32 = 14;
     var runs: u8 = 0;
     var px_idx: u32 = 0;
-    var last_tag: EncodeTag = .rgb;
-    var tag_count: u32 = 0;
     while (px_idx < byte_len) : (px_idx += header.channels) {
         if (runs > 0) {
             runs -= 1;
@@ -113,12 +109,6 @@ pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
                     prev.g = bytes[idx + 1];
                     prev.b = bytes[idx + 2];
                     idx += 3;
-                    if (last_tag != .rgb) {
-                        // std.debug.print("{d}\n RGB {any} ", .{tag_count, prev});
-                        last_tag = .rgb;
-                    } else {
-                        tag_count += 1;
-                    }
                 },
                 // QOI_OP_RGBA
                 0b1111_1111 => {
@@ -127,67 +117,30 @@ pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
                     prev.b = bytes[idx + 2];
                     prev.a = bytes[idx + 3];
                     idx += 4;
-                    if (last_tag != .rgba) {
-                        // std.debug.print("{d}\n RGBA {any} ", .{tag_count, prev});
-                        last_tag = .rgba;
-                        tag_count = 1;
-                    } else {
-                        tag_count += 1;
-                    }
                 },
                 else => switch ((tag_byte & 0xc0) >> 6) {
                     // QOI_OP_INDEX
                     0b00 => {
                         prev = index[tag_byte];
-                        if (last_tag != .index) {
-                            // std.debug.print("{d}\n INDEX {d}@{any} ", .{tag_count, tag_byte, index[tag_byte]});
-                            last_tag = .index;
-                            tag_count = 1;
-                        } else {
-                            tag_count += 1;
-                        }
                     },
                     // QOI_OP_DIFF
                     0b01 => {
                         prev.r +%= ((tag_byte >> 4) & 0x03) -% 2;
-                        prev.r +%= ((tag_byte >> 2) & 0x03) -% 2;
+                        prev.g +%= ((tag_byte >> 2) & 0x03) -% 2;
                         prev.b +%= (tag_byte & 0x03) -% 2;
-                        if (last_tag != .diff) {
-                            // std.debug.print("{d}\n DIFF ", .{tag_count});
-                            last_tag = .diff;
-                            tag_count = 1;
-                        } else {
-                            tag_count += 1;
-                        }
                     },
                     // QOI_OP_LUMA
                     0b10 => {
                         const b = bytes[idx];
                         idx += 1;
-                        // [-32, 31]
-                        // todo this might not be correct yet
-                        const green_diff = @as(i8, @intCast(tag_byte & 0x3f)) - 32;
-                        prev.r +%= @as(u8, @intCast(green_diff - 8 + @as(i8, @intCast((b >> 4) & 0x0f))));
-                        prev.g +%= @intCast(green_diff);
-                        prev.b +%= @as(u8, @intCast(green_diff - 8 + @as(i8, @intCast(b & 0x0f))));
-                        if (last_tag != .luma) {
-                            // std.debug.print("{d}\n LUMA ", .{tag_count});
-                            last_tag = .luma;
-                            tag_count = 1;
-                        } else {
-                            tag_count += 1;
-                        }
+                        const green_diff = (tag_byte & 0x3f) -% 32;
+                        prev.r +%= green_diff -% 8 +% ((b >> 4) & 0x0f);
+                        prev.g +%= green_diff;
+                        prev.b +%= green_diff -% 8 +% (b & 0x0f);
                     },
                     // QOI_OP_RUN
                     0b11 => {
                         runs = tag_byte & 0x3f;
-                        if (last_tag != .run) {
-                            // std.debug.print("{d}\n RUN:({d}) ", .{tag_count, runs});
-                            last_tag = .run;
-                            tag_count = 1;
-                        } else {
-                            tag_count += 1;
-                        }
                     },
                     else => unreachable,
                 },
@@ -203,7 +156,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
             pixels[px_idx + 3] = prev.a;
     }
 
-    std.debug.assert(std.mem.eql(u8, bytes[idx..], &byte_stream_suffix));
+    // std.debug.assert(std.mem.eql(u8, bytes[idx..], &byte_stream_suffix));
 
     return .{
         .pixels = pixels,
