@@ -156,7 +156,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) !Qoi {
             pixels[px_idx + 3] = prev.a;
     }
 
-    // std.debug.assert(std.mem.eql(u8, bytes[idx..], &byte_stream_suffix));
+    std.debug.assert(std.mem.eql(u8, bytes[idx..], &byte_stream_suffix));
 
     return .{
         .pixels = pixels,
