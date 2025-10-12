@@ -9,6 +9,8 @@ pub const magic_number = 0x716f6966;
 pub const DecodeError = error{ InvalidQoi, ImageTooLarge, OutOfMemory, InvalidEncoding };
 pub const EncodeError = error{ EmptyPixelBuffer, ZeroPixelCount, ImageTooLarge, OutOfMemory };
 
+/// Holds image pixel and meta data.
+/// `pixels` stores pixels top to bottom, left to right
 pub const Image = struct {
     pixels: []u8,
     width: u32,
@@ -31,6 +33,7 @@ pub const Colorspace = enum(u8) {
     linear = 1,
 };
 
+/// QOI header info
 pub const Desc = struct {
     const size = 14;
     width: u32,
@@ -78,6 +81,22 @@ const Pixel = packed struct(u32) {
     }
 };
 
+/// Does a few quick checks on `data` to determine if it holds a qoi image.
+///
+/// It tries to parse a `Desc` from `data` and checks if `data` can hold
+/// the minimal encoded image.
+pub fn isQoi(data: []const u8) bool {
+    if (data.len < Desc.size + 1 + encoding_epilogue.len) return false;
+    _ = Desc.decode(data) catch return false;
+    return true;
+}
+
+/// Encodes `pixels` into QOI format if it is non-empty and `desc` describes
+/// a valid image.
+///
+/// Note: Encodes a QOI description header before the QOI encoding ops.
+/// 
+/// Caller owns returned memory.
 pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
     const pixel_count = desc.height * desc.width;
 
@@ -90,6 +109,7 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
     // along with an rbg(a) tag byte
     const max_size = pixel_count * (channels + 1) + Desc.size + encoding_epilogue.len;
 
+    // todo: don't preallocate so much extra
     var bytes_list: std.ArrayList(u8) = try .initCapacity(gpa, max_size);
     var bytes = bytes_list.allocatedSlice();
 
@@ -225,8 +245,11 @@ fn debug(tag: u8, off: u32, px: Pixel) void {
     std.debug.print("{x} {s} px: 0x{x}\n", .{ off, name, @as(u32, @bitCast(px)) });
 }
 
-pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Image {
-    const desc = try Desc.decode(bytes);
+/// Decodes the QOI encoded data in `data`.
+/// Assumes data begins with a QOI description header.
+pub fn decode(gpa: Allocator, data: []const u8) DecodeError!Image {
+    var read_offset: u32 = 14;
+    const desc = try Desc.decode(data);
 
     const pixel_count = desc.width * desc.height;
     if (pixel_count > max_pixels) return error.ImageTooLarge;
@@ -238,8 +261,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Image {
 
     var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
     var prev_pixel = Pixel{};
-    const chunks_len = bytes.len - encoding_epilogue.len;
-    var read_offset: u32 = 14;
+    const chunks_len = data.len - encoding_epilogue.len;
     var run_len: u8 = 0;
 
     var pixel_offset: u32 = 0;
@@ -247,20 +269,20 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Image {
         if (run_len > 0) {
             run_len -= 1;
         } else if (read_offset < chunks_len) {
-            const tag = bytes[read_offset];
+            const tag = data[read_offset];
             read_offset += 1;
             switch (tag) {
                 Encoding.rgb => {
-                    prev_pixel.r = bytes[read_offset];
-                    prev_pixel.g = bytes[read_offset + 1];
-                    prev_pixel.b = bytes[read_offset + 2];
+                    prev_pixel.r = data[read_offset];
+                    prev_pixel.g = data[read_offset + 1];
+                    prev_pixel.b = data[read_offset + 2];
                     read_offset += 3;
                 },
                 Encoding.rgba => {
-                    prev_pixel.r = bytes[read_offset];
-                    prev_pixel.g = bytes[read_offset + 1];
-                    prev_pixel.b = bytes[read_offset + 2];
-                    prev_pixel.a = bytes[read_offset + 3];
+                    prev_pixel.r = data[read_offset];
+                    prev_pixel.g = data[read_offset + 1];
+                    prev_pixel.b = data[read_offset + 2];
+                    prev_pixel.a = data[read_offset + 3];
                     read_offset += 4;
                 },
                 else => switch (tag & 0xc0) {
@@ -273,7 +295,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Image {
                         prev_pixel.b +%= (tag & 0x03) -% 2;
                     },
                     Encoding.luma => {
-                        const b = bytes[read_offset];
+                        const b = data[read_offset];
                         read_offset += 1;
                         const green_diff = (tag & 0x3f) -% 32;
                         prev_pixel.r +%= green_diff -% 8 +% ((b >> 4) & 0x0f);

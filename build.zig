@@ -3,21 +3,32 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const exe = b.addExecutable(.{
-        .name = "qoiconv",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+    const build_tool = b.option(bool, "tool", "Build qoi cli tool") orelse true;
+
+    const qoi_mod = b.addModule("qoi", .{
+        .root_source_file = b.path("src/qoi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    if (build_tool) {
+        const exe = b.addExecutable(.{
+            .name = "qoi",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const zigimg_dep = b.dependency("zigimg", .{
             .target = target,
             .optimize = optimize,
-        }),
-    });
+        });
 
-    exe.addIncludePath(b.path("src/c"));
-    exe.addCSourceFile(.{
-        .file = b.path("src/c/stb.c"),
-        .flags = &[_][]const u8{"-std=c99"},
-    });
-    exe.linkLibC();
+        exe.root_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+        exe.root_module.addImport("qoi", qoi_mod);
 
-    b.installArtifact(exe);
+        b.installArtifact(exe);
+    }
+
 }

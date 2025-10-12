@@ -5,7 +5,7 @@
             "name": "(vsdbg) launch",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/zig-out/bin/qoiconv.exe",
+            "program": "${workspaceFolder}/zig-out/bin/qoi",
             "symbolSearchPath": "${workspaceFolder}/zig-out/bin",
             "args": [],
             "stopAtEntry": false,
