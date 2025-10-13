@@ -6,7 +6,7 @@ pub const encoding_epilogue = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
 pub const signature = [4]u8{ 'q', 'o', 'i', 'f' };
 pub const magic_number = 0x716f6966;
 
-pub const DecodeError = error{ InvalidQoi, ImageTooLarge, OutOfMemory, InvalidEncoding };
+pub const DecodeError = error{ TooSmall, MissingSignature, ZeroDimension, InvalidChannel, InvalidColorspace, ImageTooLarge, OutOfMemory, InvalidEncoding };
 pub const EncodeError = error{ EmptyPixelBuffer, ZeroPixelCount, ImageTooLarge, OutOfMemory };
 
 /// Holds image pixel and meta data.
@@ -42,21 +42,21 @@ pub const Desc = struct {
     colorspace: Colorspace,
 
     pub fn decode(data: []const u8) DecodeError!Desc {
-        if (data.len < size) return error.InvalidQoi;
-        if (std.mem.readInt(u32, data[0..4], .big) != magic_number) return error.InvalidQoi;
+        if (data.len < size) return error.TooSmall;
+        if (std.mem.readInt(u32, data[0..4], .big) != magic_number) return error.MissingSignature;
 
         const width = std.mem.readInt(u32, data[4..8], .big);
         const height = std.mem.readInt(u32, data[8..12], .big);
         const channels = data[12];
         const colorspace = data[13];
 
-        if (width == 0 or height == 0) return error.InvalidQoi;
+        if (width == 0 or height == 0) return error.ZeroDimension;
 
         return .{
             .width = width,
             .height = height,
-            .channels = std.enums.fromInt(Channel, channels) orelse return error.InvalidQoi,
-            .colorspace = std.enums.fromInt(Colorspace, colorspace) orelse return error.InvalidQoi,
+            .channels = std.enums.fromInt(Channel, channels) orelse return error.InvalidChannel,
+            .colorspace = std.enums.fromInt(Colorspace, colorspace) orelse return error.InvalidColorspace,
         };
     }
 };

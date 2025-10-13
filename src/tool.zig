@@ -49,9 +49,12 @@ pub fn main() !void {
 
     if (args.len == 2) {
         const subject_bytes = try std.fs.cwd().readFile(args[1], &iobuf);
-        const desc = qoi.Desc.decode(subject_bytes) catch std.process.exit(1);
         var stdout = std.fs.File.stdout().writer(&iobuf);
-        try stdout.interface.print("{any}\n", .{ desc });
+        if (qoi.Desc.decode(subject_bytes)) |desc| {
+            try stdout.interface.print("{any}\n", .{ desc });
+        } else |err| {
+            try stdout.interface.print("{t}\n", .{ err });
+        }
         try stdout.interface.flush();
         return;
     }
