@@ -102,7 +102,7 @@ pub fn isQoi(data: []const u8) bool {
 ///
 /// Caller owns returned memory.
 pub fn encodeAlloc(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
-    const estimated_size = @max(pixels.len * 32 / 100, 512);
+    const estimated_size = @max(pixels.len * 16 / 100, 512);
     var allocating = try std.Io.Writer.Allocating.initCapacity(gpa, estimated_size);
     errdefer allocating.deinit();
 
@@ -240,7 +240,7 @@ fn debug(tag: u8, off: u32, px: Pixel) void {
 /// Decodes the QOI encoded data in `data`.
 /// Assumes data begins with a QOI description header.
 pub fn decodeAlloc(gpa: Allocator, data: []const u8) DecodeError!Image {
-    var allocating = try std.Io.Writer.Allocating.initCapacity(gpa, data.len * 32);
+    var allocating = try std.Io.Writer.Allocating.initCapacity(gpa, data.len * 16);
     errdefer allocating.deinit();
     const desc = try decode(&allocating.writer, data);
     return .{
