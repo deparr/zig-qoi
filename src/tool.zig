@@ -115,7 +115,7 @@ pub fn main() !void {
     };
 
     if (input_format == .qoi) {
-        const image = try qoi.decode(gpa, input_bytes);
+        const image = try qoi.decodeAlloc(gpa, input_bytes);
         defer image.deinit(gpa);
 
         switch (output_format.?) {
@@ -151,7 +151,7 @@ pub fn main() !void {
             .rgba32 => .rgba,
             else => .rgb,
         };
-        const qoi_bytes = try qoi.encode(gpa, image.pixels.asConstBytes(), .{
+        const qoi_bytes = try qoi.encodeAlloc(gpa, image.pixels.asConstBytes(), .{
             .width = @truncate(image.width),
             .height = @truncate(image.height),
             .channels = channels,

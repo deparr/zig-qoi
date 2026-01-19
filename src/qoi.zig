@@ -6,8 +6,8 @@ pub const encoding_epilogue = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
 pub const signature = [4]u8{ 'q', 'o', 'i', 'f' };
 pub const magic_number = 0x716f6966;
 
-pub const DecodeError = error{ TooSmall, MissingSignature, ZeroDimension, InvalidChannel, InvalidColorspace, ImageTooLarge, OutOfMemory, InvalidEncoding };
-pub const EncodeError = error{ EmptyPixelBuffer, ZeroPixelCount, ImageTooLarge, OutOfMemory };
+pub const DecodeError = error{ TooSmall, MissingSignature, ZeroDimension, InvalidChannel, InvalidColorspace, ImageTooLarge, OutOfMemory, InvalidEncoding, WriteFailed };
+pub const EncodeError = error{ EmptyPixelBuffer, ZeroPixelCount, ImageTooLarge, OutOfMemory, WriteFailed };
 
 /// Holds image pixel and meta data.
 /// `pixels` stores pixels top to bottom, left to right
@@ -79,6 +79,10 @@ const Pixel = packed struct(u32) {
     pub fn hash(self: Pixel) u8 {
         return @truncate((@as(u16, self.r) * 3 + @as(u16, self.g) * 5 + @as(u16, self.b) * 7 + @as(u16, self.a) * 11) % 64);
     }
+
+    pub fn rgb(self: Pixel) u24 {
+        return @as(u24, self.r) << 16 | @as(u24, self.g) << 8 | @as(u24, self.b);
+    }
 };
 
 /// Does a few quick checks on `data` to determine if it holds a qoi image.
@@ -95,9 +99,23 @@ pub fn isQoi(data: []const u8) bool {
 /// a valid image.
 ///
 /// Note: Encodes a QOI description header before the QOI encoding ops.
-/// 
+///
 /// Caller owns returned memory.
-pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
+pub fn encodeAlloc(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
+    const estimated_size = @max(pixels.len * 32 / 100, 512);
+    var allocating = try std.Io.Writer.Allocating.initCapacity(gpa, estimated_size);
+    errdefer allocating.deinit();
+
+    try encode(&allocating.writer, pixels, desc);
+
+    return allocating.toOwnedSlice();
+}
+
+/// encodes `pixels` as QOI and writes the result into `stream`
+///
+/// Note: writes a qoi header before any pixel encodings.
+/// Note: the qoi epilogue is written to `stream` after the pixel encodings
+pub fn encode(stream: *std.Io.Writer, pixels: []const u8, desc: Desc) EncodeError!void {
     const pixel_count = desc.height * desc.width;
 
     if (pixels.len == 0) return error.EmptyPixelBuffer;
@@ -105,30 +123,22 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
     if (pixel_count >= max_pixels) return error.ImageTooLarge;
 
     const channels = @intFromEnum(desc.channels);
-    // based on the worstcase of every pixel being encoded individually
-    // along with an rbg(a) tag byte
-    const max_size = pixel_count * (channels + 1) + Desc.size + encoding_epilogue.len;
 
-    // todo: don't preallocate so much extra
-    var bytes_list: std.ArrayList(u8) = try .initCapacity(gpa, max_size);
-    var bytes = bytes_list.allocatedSlice();
-
-    std.mem.writeInt(u32, bytes[0..4], magic_number, .big);
-    std.mem.writeInt(u32, bytes[4..8], desc.width, .big);
-    std.mem.writeInt(u32, bytes[8..12], desc.height, .big);
-    bytes[12] = channels;
-    bytes[13] = @intFromEnum(desc.colorspace);
-
-    var write_offset: u32 = Desc.size;
-
-    const pixel_len = pixel_count * channels;
-    const pixel_end = pixel_len - channels;
+    // better errors?
+    // write header
+    try stream.writeAll(&signature);
+    try stream.writeInt(u32, desc.width, .big);
+    try stream.writeInt(u32, desc.height, .big);
+    try stream.writeByte(channels);
+    try stream.writeByte(@intFromEnum(desc.colorspace));
 
     var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
     var prev_pixel = Pixel{};
     var curr_pixel = Pixel{};
     var run_len: u8 = 0;
 
+    const pixel_len = pixel_count * channels;
+    const last_pixel = pixel_len - channels;
     var pixel_offset: u32 = 0;
     while (pixel_offset < pixel_len) : (pixel_offset += channels) {
         curr_pixel.r = pixels[pixel_offset];
@@ -140,9 +150,8 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
         // continue an active run
         if (curr_pixel == prev_pixel) {
             run_len += 1;
-            if (run_len == 62 or pixel_offset == pixel_end) {
-                bytes[write_offset] = Encoding.run | (run_len - 1);
-                write_offset += 1;
+            if (run_len == 62 or pixel_offset == last_pixel) {
+                try stream.writeByte(Encoding.run | (run_len - 1));
                 run_len = 0;
             }
         } else {
@@ -150,8 +159,7 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
 
             // finish an active run
             if (run_len > 0) {
-                bytes[write_offset] = Encoding.run | (run_len - 1);
-                write_offset += 1;
+                try stream.writeByte(Encoding.run | (run_len - 1));
                 run_len = 0;
             }
 
@@ -159,8 +167,7 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
 
             // save an index
             if (index[index_pos] == curr_pixel) {
-                bytes[write_offset] = Encoding.index | index_pos;
-                write_offset += 1;
+                try stream.writeByte(Encoding.index | index_pos);
             } else {
                 index[index_pos] = curr_pixel;
 
@@ -181,8 +188,7 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
                         const r_diff2 = (r_diff +% 2) << 4;
                         const g_diff2 = (g_diff +% 2) << 2;
                         const b_diff2 = b_diff +% 2;
-                        bytes[write_offset] = Encoding.diff | r_diff2 | g_diff2 | b_diff2;
-                        write_offset += 1;
+                        try stream.writeByte(Encoding.diff | r_diff2 | g_diff2 | b_diff2);
 
                         // luminance diff
                         // -9 < rb_diff < 8
@@ -194,27 +200,19 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
                         const g_diff2 = g_diff +% 32;
                         const rg_diff2 = (rg_diff +% 8) << 4;
                         const bg_diff2 = (bg_diff +% 8);
-                        bytes[write_offset] = Encoding.luma | g_diff2;
-                        bytes[write_offset + 1] = rg_diff2 | bg_diff2;
-                        write_offset += 2;
+                        try stream.writeByte(Encoding.luma | g_diff2);
+                        try stream.writeByte(rg_diff2 | bg_diff2);
 
                         // store single rgb pixel
                     } else {
-                        bytes[write_offset] = Encoding.rgb;
-                        bytes[write_offset + 1] = curr_pixel.r;
-                        bytes[write_offset + 2] = curr_pixel.g;
-                        bytes[write_offset + 3] = curr_pixel.b;
-                        write_offset += 4;
+                        try stream.writeByte(Encoding.rgb);
+                        try stream.writeInt(u24, curr_pixel.rgb(), .big);
                     }
 
                     // store single rgba pixel
                 } else {
-                    bytes[write_offset] = Encoding.rgba;
-                    bytes[write_offset + 1] = curr_pixel.r;
-                    bytes[write_offset + 2] = curr_pixel.g;
-                    bytes[write_offset + 3] = curr_pixel.b;
-                    bytes[write_offset + 4] = curr_pixel.a;
-                    write_offset += 5;
+                    try stream.writeByte(Encoding.rgba);
+                    try stream.writeStruct(curr_pixel, .big);
                 }
             }
         }
@@ -222,13 +220,7 @@ pub fn encode(gpa: Allocator, pixels: []const u8, desc: Desc) EncodeError![]u8 {
         prev_pixel = curr_pixel;
     }
 
-    @memcpy(bytes[write_offset .. write_offset + 8], &encoding_epilogue);
-    write_offset += 8;
-
-    bytes_list.items = bytes[0..write_offset];
-    // bytes_list.shrinkAndFree(gpa, write_offset);
-
-    return try bytes_list.toOwnedSlice(gpa);
+    try stream.writeAll(&encoding_epilogue);
 }
 
 fn debug(tag: u8, off: u32, px: Pixel) void {
@@ -247,35 +239,47 @@ fn debug(tag: u8, off: u32, px: Pixel) void {
 
 /// Decodes the QOI encoded data in `data`.
 /// Assumes data begins with a QOI description header.
-pub fn decode(gpa: Allocator, data: []const u8) DecodeError!Image {
-    var read_offset: u32 = 14;
+pub fn decodeAlloc(gpa: Allocator, data: []const u8) DecodeError!Image {
+    var allocating = try std.Io.Writer.Allocating.initCapacity(gpa, data.len * 32);
+    errdefer allocating.deinit();
+    const desc = try decode(&allocating.writer, data);
+    return .{
+        .pixels = try allocating.toOwnedSlice(),
+        .width = desc.width,
+        .height = desc.height,
+        .channels = desc.channels,
+        .colorspace = desc.colorspace,
+    };
+}
+
+/// decodes a `qoi` image from `data` into `stream`
+///
+/// on error.InvalidEncoding the stream may have received a partially decoded
+/// image
+pub fn decode(stream: *std.Io.Writer, data: []const u8) DecodeError!Desc {
     const desc = try Desc.decode(data);
 
     const pixel_count = desc.width * desc.height;
     if (pixel_count > max_pixels) return error.ImageTooLarge;
 
-    const channels = @intFromEnum(desc.channels);
-    const byte_len = pixel_count * channels;
-    var pixels = try gpa.alloc(u8, byte_len);
-    errdefer gpa.free(pixels);
-
     var index: [64]Pixel = .{Pixel{ .a = 0 }} ** 64;
     var prev_pixel = Pixel{};
-    const chunks_len = data.len - encoding_epilogue.len;
     var run_len: u8 = 0;
 
-    var pixel_offset: u32 = 0;
-    while (pixel_offset < byte_len) : (pixel_offset += channels) {
+    var read_offset: u32 = Desc.size;
+    // todo this is kinda sus
+    const last_encoding = data.len - encoding_epilogue.len;
+    for (0..pixel_count) |_| {
         if (run_len > 0) {
             run_len -= 1;
-        } else if (read_offset < chunks_len) {
+        } else if (read_offset < last_encoding) {
             const tag = data[read_offset];
             read_offset += 1;
             switch (tag) {
                 Encoding.rgb => {
                     prev_pixel.r = data[read_offset];
-                    prev_pixel.g = data[read_offset + 1];
-                    prev_pixel.b = data[read_offset + 2];
+                    prev_pixel.g = data[read_offset + 2];
+                    prev_pixel.b = data[read_offset + 1];
                     read_offset += 3;
                 },
                 Encoding.rgba => {
@@ -312,20 +316,14 @@ pub fn decode(gpa: Allocator, data: []const u8) DecodeError!Image {
             index[prev_pixel.hash()] = prev_pixel;
         }
 
-        pixels[pixel_offset] = prev_pixel.r;
-        pixels[pixel_offset + 1] = prev_pixel.g;
-        pixels[pixel_offset + 2] = prev_pixel.b;
-        if (desc.channels == .rgba)
-            pixels[pixel_offset + 3] = prev_pixel.a;
+        if (desc.channels == .rgba) {
+            try stream.writeStruct(prev_pixel, .big);
+        } else {
+            try stream.writeInt(u24, prev_pixel.rgb(), .big);
+        }
     }
 
-    return .{
-        .pixels = pixels,
-        .width = desc.width,
-        .height = desc.height,
-        .channels = desc.channels,
-        .colorspace = desc.colorspace,
-    };
+    return desc;
 }
 
 test "Pixel hashing" {
